@@ -1,0 +1,114 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openvpn
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: openvpn
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openvpn
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: openvpn
+subjects:
+  - kind: ServiceAccount
+    name: openvpn
+    namespace: default
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openvpn-cert-creation
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: openvpn-cert
+          image: quay.io/kubermatic/openvpn:v0.5
+          volumeMounts:
+            - mountPath: /certs
+              name: certs-volume
+          env:
+            - name: APISERVER
+              value: https://kubernetes.default.svc
+            - name: SERVICEACCOUNT
+              value: /var/run/secrets/kubernetes.io/serviceaccount
+          command:
+            - bash
+            - -ec
+            - |
+              # create secrets:
+              NAMESPACE=$(cat ${SERVICEACCOUNT}/namespace)
+              TOKEN=$(cat ${SERVICEACCOUNT}/token)
+              CACERT=${SERVICEACCOUNT}/ca.crt
+
+              for entity in ca server client
+              do
+                CRT="$(cat /certs/${entity}.crt | base64 | tr -d \\n)"
+                KEY="$(cat /certs/${entity}.key | base64 | tr -d \\n)"
+                curl --cacert ${CACERT} \
+                     --header "Authorization: Bearer ${TOKEN}" \
+                     --header "Content-type: application/json" \
+                      -X POST ${APISERVER}/api/v1/namespaces/${NAMESPACE}/secrets \
+                      -d '
+                    {
+                      "apiVersion":"v1",
+                      "data":{
+                        "'${entity}'.crt":"'${CRT}'",
+                        "'${entity}'.key":"'${KEY}'"
+                      },
+                      "kind":"Secret",
+                      "metadata":{
+                        "name":"openvpn-'${entity}'",
+                        "namespace":"default"
+                      },
+                      "type":"Opaque"
+                    }
+                '
+              done
+
+      initContainers:
+        - name: openvpn-cert-init
+          image: quay.io/kubermatic/openvpn:v0.5
+          volumeMounts:
+            - mountPath: /certs
+              name: certs-volume
+          command:
+            - bash
+            - -ec
+            - |
+              # create certs
+              wget https://github.com/OpenVPN/easy-rsa/releases/download/v3.0.6/EasyRSA-unix-v3.0.6.tgz
+              tar -xvf EasyRSA-unix-v3.0.6.tgz
+              cd EasyRSA-v3.0.6
+
+              ./easyrsa init-pki
+              openssl rand -out pki/.rnd -hex 256 2>&1
+              ./easyrsa --batch build-ca nopass
+              ./easyrsa build-server-full server nopass
+              ./easyrsa build-client-full client nopass
+
+              cp -r pki/{issued/*,ca.crt,private/*} /certs
+
+      volumes:
+        - name: certs-volume
+          emptyDir: {}
+      serviceAccountName: openvpn
